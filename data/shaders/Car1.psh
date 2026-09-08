@@ -1,0 +1,539 @@
+// Pixel Shader : CAR1
+/*
+ ================================================================================
+ Mod Name   :    Live For Shader
+ Version    :    1.0.0
+ Date       :    2026-09-08
+ Author     :    obdegirmenci
+ Description:    Fully rewritten pixel & vertex shader overhaul.
+ - Improved lighting and reflections
+ - Better reflection rendering
+ ================================================================================
+ */
+
+// ==============================================================================
+// Changes from 0.6H default pixel shader
+// ==============================================================================
+// refactor(pixel-shader): implement per-pixel lighting and advanced paint material system
+//
+// Complete rewrite of the Car1 pixel shader with physically-based material
+// properties and per-pixel lighting.
+// Improved with consistent indentation (4 spaces) and comprehensive comments.
+//
+// BREAKING CHANGES:
+// - Vertex shader now outputs Normal, LightDir, EyeVec (TEXCOORD4-6)
+// - oD0 no longer contains NdotL (only raw sun_col * vertex color)
+// - EnvA.x changed: now raw fresnel (Schlick) instead of pre-scaled value
+// - EnvA.y = envmaplevel.a (global env intensity, applied once in PSH)
+//
+// NEW FEATURES:
+// - Per-pixel diffuse lighting (NdotL computed in pixel shader)
+// - Glass reflection strength now properly clamped/controlled
+// - Paint type system (0=Solid, 1=Matte, 2=Metallic, 3=Pearlescent, 4=Chrome)
+// - Flake effect for metallic paint (hash-based procedural flakes)
+// - Pearlescent color shifting with hue-preserving rotation matrix
+// - Dark plastic/bumper masking (luminance-based, keeps trim matte)
+// - Separate glass reflections with dedicated Fresnel power control
+// - Clearcoat specular layer driven by Fresnel
+// - Debug mask visualization (4 different mask types)
+//
+// MATERIAL PARAMETERS (static const):
+// - PaintType, UseAutoPearlColor, ManualPearlColor
+// - PearlHueShift, PearlIridescentStrength, PearlEnvScale
+// - FlakeIntensityGlobal, FlakeDensity
+// - DarkPlasticThreshold, DarkPlasticSoftness, EnableDarkPlasticMask
+// - GlassReflectionStrength, GlassFresnelPower
+// - DebugMask
+//
+// DIFFUSE LIGHTING CONTROLS:
+// - exponent = controls falloff width (1.0 = natural, <1 = wider, >1 = tighter)
+// - intensity = multiplies final brightness (1.75 = 75% brighter for painted body)
+//
+// FIXES (compared to legacy version):
+// - Fixed double-scale envmap bug (fresnel * envLevel now applied exactly once)
+//
+// PERFORMANCE NOTES:
+// - Hue rotation matrix uses compile-time trigonometry (mul3x3 only)
+// - Compatible with PS 2.0 instruction limits
+// - Conditional branches resolved at compile time (static const)
+
+#define SHINY
+
+//=============================================================================
+// Input Structure (must mirror VS_OUTPUT in the vertex shader)
+//=============================================================================
+
+// Vertex shader output structure
+struct VS_OUTPUT
+{
+    float4 oPos : POSITION;    // Clip space position (unused in pixel shader)
+
+    float4 oD0 : COLOR0;       // Direct light (raw sun * vertex color, no NdotL)
+    float4 oD1 : COLOR1;       // Ambient (hemisphere) light
+
+    float2 oT0 : TEXCOORD0;    // Lightmap texture coordinates
+    float2 oT1 : TEXCOORD1;    // Base texture coordinates
+
+    #ifdef SHINY
+    float2 oT2 : TEXCOORD2;    // Environment map reflection coordinates
+    float2 EnvA : TEXCOORD3;   // x = raw fresnel, y = envmaplevel.a
+    #endif
+
+    float3 Normal   : TEXCOORD4;   // Vertex normal (interpolated per-pixel)
+    float3 LightDir : TEXCOORD5;   // Light direction (interpolated per-pixel)
+    float3 EyeVec   : TEXCOORD6;   // Eye vector (interpolated per-pixel)
+
+    float oFog : FOG;              // Fog factor (unused in this shader)
+};
+
+//=============================================================================
+// Pixel Shader Output Structure
+//=============================================================================
+struct PS_OUTPUT
+{
+    float4 Colour : COLOR0;    // Final output color
+};
+
+//=============================================================================
+// Texture Samplers
+//=============================================================================
+
+sampler2D s_T0 : register(s0);   // Lightmap texture (registered as sampler 0)
+sampler2D s_T1 : register(s1);   // Base / paint texture (registered as sampler 1)
+
+#ifdef SHINY
+sampler2D s_T2 : register(s2);   // Environment map / hemisphere / fisheye (sampler 2)
+#endif
+
+//=============================================================================
+// Paint Type Selector
+//=============================================================================
+// 0 = Solid       – plain colour, no special reflectivity
+// 1 = Matte       – low-gloss, diffuse env scatter
+// 2 = Metallic    – flake highlights, full env reflection
+// 3 = Pearlescent – colour-shifting iridescence near the car's base hue
+// 4 = Chrome      – near-perfect mirror reflection, heavily env-dominant
+// ---------------------------------------------------------------------------
+
+#define ACTIVE_PAINT 2   // 2 = Metallic
+
+//=============================================================================
+// Metallic Settings
+//=============================================================================
+
+static const float FlakeIntensityGlobal = 0.48f;  // 0.45
+static const float FlakeDensity         = 0.80f;  // 0–1, higher = fewer flakes
+static const float FlakeSize            = 512.0f; // 256=large flakes, 512=default, 1024=fine
+
+//=============================================================================
+// Pearlescent Settings
+//=============================================================================
+
+// UseAutoPearlColor = 1 : derive the secondary pearl colour from the car's
+// own base colour with a warm/cool hue tilt (stays close to the original hue).
+// UseAutoPearlColor = 0 : use ManualPearlColor directly.
+static const int   UseAutoPearlColor = 1;
+static const float3 ManualPearlColor = float3(0.85f, 0.88f, 0.75f); // Example: Misty Morning
+
+// PearlHueShift: how far the secondary pearl colour shifts.
+// 0.0 = no shift (same as base), 1.0 = full tilt.
+static const float PearlHueShift = 0.05f;
+
+// PearlIridescentStrength: strength of the iridescent swirl.
+// 0.0 = none, 0.3 = subtle, higher values drift away from the base hue.
+static const float PearlIridescentStrength = 1.0f;
+
+// PearlEnvScale: how much of the env reflection is mixed into pearl.
+static const float PearlEnvScale = 0.55f;
+
+//=============================================================================
+// Chrome Settings
+//=============================================================================
+// ChromeEnvStrength : How much of the final colour comes from the env map.
+//   1.0 = full mirror (100% env), 0.7 = slight base colour bleeding through.
+// ChromeFresnelPower : Higher = sharper edge-to-center transition.
+//   Chrome should be low (1.0-2.0): it stays reflective even when facing you.
+// ChromeBaseTint : A subtle tint multiplied onto the env reflection.
+//   float3(1,1,1) = neutral silver, float3(0.9,0.95,1) = cold blue-chrome,
+//   float3(1,0.9,0.8) = warm gold-chrome.
+// ChromeGlossContrast : Boosts the bright/dark contrast of the reflection.
+//   1.0 = raw env, 1.5 = punchier highlights, 2.0 = very contrasty.
+//=============================================================================
+
+static const float  ChromeEnvStrength   = 1.00f;
+static const float  ChromeFresnelPower  = 2.0f;
+static const float3 ChromeBaseTint      = float3(0.90f, 0.92f, 0.95f); // Cool silver
+static const float  ChromeGlossContrast = 1.75f;
+
+//=============================================================================
+// Dark Plastic / Bumper Masking
+//=============================================================================
+// Pixels whose base texture luminance is below DarkPlasticThreshold will NOT
+// receive paint effects (flakes, pearl, clearcoat), keeping bumpers matte.
+// ---------------------------------------------------------------------------
+
+static const float DarkPlasticThreshold  = 0.85f;
+static const float DarkPlasticSoftness   = 0.10f;
+static const int   EnableDarkPlasticMask = 1;
+
+//=============================================================================
+// Glass / Window Settings
+//=============================================================================
+
+// GlassReflectionStrength: peak reflectivity of windows at grazing angle.
+// Physically realistic range: 0.4–0.8. Values above 1.0 are overbright.
+static const float GlassReflectionStrength = 2.4f;
+
+// GlassFresnelPower: higher = sharper reflections (grazing angles only).
+// lower = softer, wider reflections.
+static const float GlassFresnelPower       = 2.0f;
+
+//=============================================================================
+// DEBUG SETTINGS
+//=============================================================================
+// 0 = off (normal render)
+// 1 = paintEffectMask
+// 2 = bodyMask
+// 3 = glassMask
+// 4 = darkPlasticMask (luminance-based, before body multiply)
+// ---------------------------------------------------------------------------
+
+static const int DebugMask = 0;
+
+//=============================================================================
+// Hue Shift Function (for Pearlescent Effect)
+//=============================================================================
+// Lightweight hue rotation in RGB space using a precomputed matrix approach.
+// At a constant PearlHueShift the compiler folds all trig at compile time,
+// costing only a mul3x3 — well within PS 2.0 instruction limits.
+// Every hue rotates by the same angle toward its neighbour:
+//   orange -> yellow-orange, blue -> blue-cyan, green -> yellow-green.
+// ---------------------------------------------------------------------------
+
+float3 HuePearlShift(float3 col, float shift)
+{
+    // Rotation angle in radians
+    float  a  = shift * 6.28318f; // shift * 2*PI
+    float  ca = cos(a);
+    float  sa = sin(a);
+
+    // Hue rotation matrix (luma-preserving RGB rotation, derived from YIQ color space)
+    float3 row0 = float3( 0.213f + ca*0.787f - sa*0.213f,
+                          0.715f - ca*0.715f - sa*0.715f,
+                          0.072f - ca*0.072f + sa*0.928f );
+    float3 row1 = float3( 0.213f - ca*0.213f + sa*0.143f,
+                          0.715f + ca*0.285f + sa*0.140f,
+                          0.072f - ca*0.072f - sa*0.283f );
+    float3 row2 = float3( 0.213f - ca*0.213f - sa*0.787f,
+                          0.715f - ca*0.715f + sa*0.715f,
+                          0.072f + ca*0.928f + sa*0.072f );
+
+    return saturate(float3(dot(col, row0), dot(col, row1), dot(col, row2)));
+}
+
+//=============================================================================
+// Main Pixel Shader Function
+//=============================================================================
+
+PS_OUTPUT ps_main(in VS_OUTPUT In)
+{
+    PS_OUTPUT Out;
+
+    //---------------------------------------------------------------------
+    // Texture Samples
+    //---------------------------------------------------------------------
+
+    // Lightmap sample – contains precomputed lighting information
+    float4 lightmap_col = tex2D(s_T0, In.oT0);
+
+    // Base texture sample – diffuse/albedo color of the car material
+    float4 texture_col = tex2D(s_T1, In.oT1);
+
+    #ifdef SHINY
+    // Environment map sample – reflection map for specular highlights
+    float4 envmap_col = tex2D(s_T2, In.oT2);
+    #endif
+
+    //---------------------------------------------------------------------
+    // Body / Glass Masks (derived from texture alpha)
+    //---------------------------------------------------------------------
+    // Alpha near 1.0  → opaque paint body
+    // Alpha near 0.0  → glass / windows
+    //---------------------------------------------------------------------
+
+    float bodyMask  = saturate((texture_col.a - 0.80f) * 10.0f);
+    float glassMask = saturate((1.00f - texture_col.a) * 10.0f);
+
+    //---------------------------------------------------------------------
+    // Dark-Plastic Mask (excludes bumpers/trim from paint effects)
+    //---------------------------------------------------------------------
+
+    float paintEffectMask = bodyMask;
+    if (EnableDarkPlasticMask == 1)
+    {
+        float orig_luma       = dot(texture_col.rgb, float3(0.299f, 0.587f, 0.114f));
+        float darkPlasticMask = saturate((orig_luma - DarkPlasticThreshold) / DarkPlasticSoftness);
+        paintEffectMask       = bodyMask * darkPlasticMask;
+    }
+
+    //---------------------------------------------------------------------
+    // Per-Pixel Diffuse Lighting Setup
+    //---------------------------------------------------------------------
+    // Re-normalize interpolated vectors for per-pixel accuracy
+    float3 N = normalize(In.Normal);
+    float3 L = normalize(In.LightDir);
+    float NdotL = saturate(dot(N, L));
+
+    //---------------------------------------------------------------------
+    // PER-PIXEL DIFFUSE LIGHTING WITH POWER FUNCTION (FALLOFF CONTROL)
+    //---------------------------------------------------------------------
+    // NdotL = surface orientation relative to sun (0 = dark, 1 = fully lit)
+    //
+    // ADJUSTABLE PARAMETERS:
+    //
+    // 1. exponent = controls how WIDE the bright area is
+    //    exponent = 1.0  -> natural/physical falloff (linear)
+    //    exponent = 0.7  -> wider bright area (more surfaces catch light)
+    //    exponent = 1.5  -> narrower bright spot (only surfaces facing sun exactly)
+    //    exponent = 2.0  -> very sharp, glossy falloff
+    //
+    // 2. intensity = multiplies the final brightness
+    //    intensity = 1.0  -> Game default
+    //    intensity = 1.5  -> 50% brighter
+    //    intensity = 2.0  -> 100% brighter
+    //    intensity = 0.5  -> 50% darker
+    //
+    // EXAMPLE COMBINATIONS:
+    //   pow(NdotL, 1.0f) * 1.5f  = natural falloff, 50% brighter
+    //   pow(NdotL, 1.5f) * 1.8f  = tighter highlight, extra bright
+    //   pow(NdotL, 0.8f) * 1.2f  = wider soft light, slightly brighter
+    //---------------------------------------------------------------------
+
+    float exponent  = 1.25f;    // <-- CHANGE THIS FOR FALLOFF WIDTH (1.0)
+    float intensity = 1.75f;   // <-- CHANGE THIS FOR BRIGHTNESS (1.5)
+
+    // Normal diffuse light (for all surfaces including glass/plastic)
+    float3 diffuse_light_normal = NdotL * In.oD0.rgb;
+
+    // Boosted diffuse light (only for painted body)
+    float3 diffuse_light_boosted = pow(NdotL, exponent) * In.oD0.rgb * intensity;
+
+    // Blend between boosted and normal using body mask
+    float3 diffuse_light = lerp(diffuse_light_normal, diffuse_light_boosted, paintEffectMask);
+
+    // Base lighting formula (original game style but with per-pixel diffuse)
+    // Multiply by alpha because, when alpha is enabled, SRC_BLEND is SRC_ONE
+    // (not reduced by alpha). This ensures proper alpha blending behavior.
+    float3 total_lighting = (diffuse_light * lightmap_col.rgb + In.oD1.rgb) * texture_col.a;
+    float3 base_color     = total_lighting * texture_col.rgb;
+
+    // Set output alpha from base texture alpha
+    // The destination pixel is reduced by this value during blending
+    Out.Colour.a = texture_col.a;
+
+    #ifdef SHINY
+    //---------------------------------------------------------------------
+    // Fresnel & Environment Map
+    //---------------------------------------------------------------------
+    // EnvA.x = raw fresnel (from VSH Schlick, no envmaplevel scaling yet)
+    // EnvA.y = envmaplevel.a  (global env intensity)
+    // Apply envmaplevel.a exactly once here.
+    //---------------------------------------------------------------------
+
+    float rawFresnel   = In.EnvA.x;               // physical Schlick fresnel
+    float envLevel     = In.EnvA.y;               // global env intensity scale
+
+    float scaledFresnel = rawFresnel * envLevel;  // final reflection intensity
+
+    // Env map colour scaled by the combined intensity
+    float3 env_reflection = envmap_col.rgb * scaledFresnel * 0.78f;
+
+    //---------------------------------------------------------------------
+    // Glass Reflections
+    //---------------------------------------------------------------------
+    // Windows use a separate, steeper Fresnel so they look clear from the
+    // front but reflective at shallow angles — physically correct for glass.
+    //---------------------------------------------------------------------
+
+    float glassFresnel = pow(abs(rawFresnel), GlassFresnelPower);
+    float3 glassReflection = envmap_col.rgb * glassFresnel
+    * GlassReflectionStrength * glassMask;
+
+    //---------------------------------------------------------------------
+    // Paint Effects (by ACTIVE_PAINT)
+    //---------------------------------------------------------------------
+
+    float3 final_color = base_color;
+
+    #define PAINT_SOLID       0
+    #define PAINT_MATTE       1
+    #define PAINT_METALLIC    2
+    #define PAINT_PEARLESCENT 3
+    #define PAINT_CHROME      4
+
+    #if ACTIVE_PAINT == PAINT_SOLID
+        // ---- Solid Paint -----------------------------------------------
+        // Pure colour, no extra reflection beyond the standard clearcoat.
+        final_color = base_color;
+
+    #elif ACTIVE_PAINT == PAINT_MATTE
+        // ---- Matte Paint -----------------------------------------------
+        // Env reflection is very weak or none (no Fresnel boost at rim).
+        float3 matte_reflection = env_reflection * 0.0f * paintEffectMask;
+        final_color = base_color + matte_reflection;
+
+    #elif ACTIVE_PAINT == PAINT_METALLIC
+        // ---- Metallic Paint --------------------------------------------
+        // Hash-based flakes sampled in screen-adjacent envmap UV space.
+        //float  flakeSizeVar = FlakeSize * (1.0f + NdotL * 0.4f);
+        //float2 flakeUV      = In.oT2 * flakeSizeVar;
+        float2 flakeUV = In.oT2 * FlakeSize;
+        float  flake   = frac(sin(dot(flakeUV, float2(12.9898f, 78.233f))) * 43758.5453f);
+        flake = saturate((flake - FlakeDensity) * 4.0f);
+
+        // Flakes are most visible at grazing angles (fresnel boost)
+        float flake_intensity = flake * paintEffectMask
+        * (0.10f + rawFresnel)
+        //* max(NdotL, 0.60f)   // minimum 0.25 — never fully dark
+        * FlakeIntensityGlobal;
+
+        // Flake colour: slightly desaturated / silver-tinted version of base
+        float3 flake_color = lerp(base_color, float3(0.85f, 0.88f, 0.92f), 0.25f);
+
+        final_color = base_color
+        + (env_reflection * paintEffectMask)
+        + (flake_color * flake_intensity);
+
+    #elif ACTIVE_PAINT == PAINT_PEARLESCENT
+        // ---- Pearlescent Paint -----------------------------------------
+        // Goal: iridescent shimmer that stays close to the car's own hue.
+        // Strategy:
+        //   1. Compute a warm-tinted secondary colour from the base colour.
+        //   2. Blend a very subtle iridescent color swirl using the pearlColor (low strength).
+        //   3. Lerp between base and the pearl result driven by Fresnel.
+        //   4. Add env reflection scaled by pearl-appropriate intensity.
+        float pearl_intensity = pow(saturate(rawFresnel), 1.5f);
+
+        // Pearl mask (separate from paintEffectMask – no floor clamp)
+        float pearlMask = bodyMask;
+        if (EnableDarkPlasticMask == 1)
+        {
+            float orig_luma = dot(texture_col.rgb, float3(0.299f, 0.587f, 0.114f));
+            float darkMask  = saturate((orig_luma - DarkPlasticThreshold) / DarkPlasticSoftness);
+            pearlMask       = bodyMask * darkMask;
+            // NOTE: No max(pearlMask, 0.2) floor – that was leaking pearl
+            // onto dark bumpers even with the mask enabled.
+        }
+
+        // Auto: shift hue by PearlHueShift in HSV space.
+        // Every colour rotates by the same amount toward its neighbour:
+        // orange -> yellow-orange, blue -> blue-cyan, green -> yellow-green.
+        float3 pearlColor;
+        if (UseAutoPearlColor == 1)
+        {
+            pearlColor = HuePearlShift(base_color, -PearlHueShift);
+        }
+        else
+        {
+            // Manual: use the chosen colour directly, hue unchanged.
+            pearlColor = ManualPearlColor;
+        }
+
+        // PearlIridescentStrength scales the visibility of the pearl colour.
+        // Higher = more vivid pearl at grazing angles, hue stays fixed.
+        // Apply pearl only where the mask allows (body, bright areas)
+        float3 pearlescent_base = lerp(base_color, pearlColor, pearlMask * pearl_intensity * PearlIridescentStrength);
+
+        // Env reflection for pearl: stronger than matte, tinted by pearl colour
+        float3 pearl_env = envmap_col.rgb * envLevel
+        * (0.5f + pearl_intensity * 0.5f)
+        * PearlEnvScale * pearlMask;
+
+        final_color = pearlescent_base + pearl_env;
+
+    #elif ACTIVE_PAINT == PAINT_CHROME
+        // Chrome mask: body panels only (alpha-based, not luma-based).
+        // Interior and non-body surfaces fall back to base_color unchanged.
+        float NdotE      = dot(normalize(In.Normal), normalize(In.EyeVec));
+        float facingMask = saturate(NdotE * 2.8f - 0.15f);
+        float chromeMask = bodyMask * facingMask;
+        //float chromeMask = bodyMask;
+
+        // Where chromeMask == 0 (interior, trim), render base_color as-is.
+        // Where chromeMask == 1 (body panels), apply chrome reflection.
+        float chromeFresnel  = saturate(pow(abs(rawFresnel), ChromeFresnelPower) * envLevel);
+        float3 contrastedEnv = pow(abs(envmap_col.rgb), 1.0f / ChromeGlossContrast);
+
+        float3 chrome_reflection = contrastedEnv
+        * ChromeBaseTint
+        * ChromeEnvStrength
+        * chromeMask;
+
+        // Full base_color where chrome doesn't apply, bleed-only where it does.
+        float3 chrome_base = lerp(base_color, base_color * ChromeEnvStrength, paintEffectMask);
+
+        final_color = chrome_base + chrome_reflection;
+
+    #endif
+
+    //---------------------------------------------------------------------
+    // Clearcoat Specular (body only, fresnel-driven)
+    //---------------------------------------------------------------------
+    // Uses scaledFresnel (already includes envmaplevel) to stay consistent.
+    //---------------------------------------------------------------------
+
+    float clearcoat = saturate(scaledFresnel * paintEffectMask);
+
+    // Disable clearcoat for Matte and Chrome paint type
+    #if ACTIVE_PAINT == PAINT_MATTE || ACTIVE_PAINT == PAINT_CHROME
+    clearcoat = 0.0f;
+    #endif
+
+    float3 clearcoat_spec = envmap_col.rgb * clearcoat * 0.25f;
+
+    //---------------------------------------------------------------------
+    // Final Composite: Paint Layer + Clearcoat + Glass Reflections
+    //---------------------------------------------------------------------
+
+    final_color += clearcoat_spec;
+    final_color += glassReflection;
+
+    Out.Colour.rgb = final_color;
+    #else
+    Out.Colour.rgb = base_color;
+    #endif
+
+    //---------------------------------------------------------------------
+    // Debug Mask Visualisation (as greyscale)
+    //---------------------------------------------------------------------
+    // White = effect active, Black = masked out (bumper/trim/glass)
+    //---------------------------------------------------------------------
+
+    if (DebugMask != 0)
+    {
+        float debugVal = 0.0f;
+
+        if (DebugMask == 1)
+        {
+            debugVal = paintEffectMask;
+        }
+        else if (DebugMask == 2)
+        {
+            debugVal = bodyMask;
+        }
+        else if (DebugMask == 3)
+        {
+            debugVal = glassMask;
+        }
+        else if (DebugMask == 4)
+        {
+            float d_luma = dot(texture_col.rgb, float3(0.299f, 0.587f, 0.114f));
+            debugVal     = saturate((d_luma - DarkPlasticThreshold) / DarkPlasticSoftness);
+        }
+
+        Out.Colour.rgb = float3(debugVal, debugVal, debugVal);
+        Out.Colour.a   = 1.0f;
+    }
+
+    return Out;
+}
